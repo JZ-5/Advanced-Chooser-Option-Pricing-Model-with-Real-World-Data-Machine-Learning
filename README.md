@@ -1,8 +1,8 @@
 # Advanced-Chooser-Option-Pricing-Model-with-Real-World-Data-Machine-Learning
-2026年6-8月暑期实习.
 
 
 
+此表格为数据规范表格
 本项目 Week 1 的初始原始数据集将包含以下多维核心字段，时间跨度为 2018-01-01 至 2024-12-31。
 
 | 字段名 (Column) | 数据类型 (Type) | 含义说明 (Description) | 数据来源 (Source) |

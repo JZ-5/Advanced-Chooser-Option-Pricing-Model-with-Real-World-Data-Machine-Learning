@@ -19,13 +19,13 @@ project_root = current_file.parent.parent
 PROCESSED_FILE_PATH = f"{project_root}/data/processed/features_ann_final.csv"
 
 USER_AGENTS = [
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15'
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 ]
 
-def get_clean_session():
+def get_authenticated_yahoo_session():
+    """高级伪装网关：先模拟人类访问雅虎主页获取合规的 Cookie 凭证，突破云端 429 限制"""
     session = requests.Session()
     if not os.getenv('GITHUB_ACTIONS'):
         PROXY_PORT = "7890"
@@ -34,13 +34,20 @@ def get_clean_session():
             "https": f"http://127.0.0.1:{PROXY_PORT}"
         })
     
-    session.headers.update({
+    headers = {
         'User-Agent': random.choice(USER_AGENTS),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1'
-    })
+    }
+    session.headers.update(headers)
+    
+    try:
+        # 悄悄访问一次主页，借用雅虎服务器颁发的合法 Cookie 挂件
+        session.get("https://finance.yahoo.com", timeout=10, verify=False)
+    except Exception:
+        pass # 静默失败，允许继续尝试下载
     return session
 
 def get_pipeline_time_window():
@@ -58,85 +65,47 @@ def get_pipeline_time_window():
     fetch_start_dt = last_recorded_date - timedelta(days=380)
     return fetch_start_dt.strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"), last_recorded_date
 
-def fetch_jpm_from_alpha_vantage(start_str, end_str):
-    """第一战略储备：利用 Alpha Vantage 官方 API 提取 JPM 股价，100% 免疫机房 IP 封锁"""
-    av_key = os.getenv("ALPHA_VANTAGE_KEY")
-    if not av_key:
-        print("未检测到 ALPHA_VANTAGE_KEY 环境变量，跳过此渠道。")
-        return pd.DataFrame()
-        
-    print("正在通过 Alpha Vantage 官方接口增量提取 JPM 股价...")
-    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=JPM&apikey={av_key}&outputsize=full"
-    
-    try:
-        proxies = None if os.getenv('GITHUB_ACTIONS') else {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
-        res = requests.get(url, proxies=proxies, timeout=15, verify=False).json()
-        
-        time_series = res.get("Time Series (Daily)", {})
-        if not time_series:
-            print(f"Alpha Vantage 未返回有效时序，响应快照: {list(res.keys())}")
-            return pd.DataFrame()
-            
-        records = []
-        for date_str, data in time_series.items():
-            if start_str <= date_str <= end_str:
-                records.append({'Date': pd.to_datetime(date_str), 'JPM_Close': float(data['4. close'])})
-                
-        if records:
-            df_av = pd.DataFrame(records).set_index('Date').sort_index()
-            print(f"成功通过 Alpha Vantage 捕获 JPM 股价样本 {len(df_av)} 行。")
-            return df_av
-    except Exception as e:
-        print(f"Alpha Vantage 提取 JPM 发生异常: {e}")
-    return pd.DataFrame()
-
-def fetch_ticker_with_hard_retry(ticker_symbol, start_str, end_str, max_retries=4):
-    """第二通道：雅虎财经抗封锁下载器。显著拉长了云端的退避等待时间"""
+def fetch_ticker_from_yahoo_safe(ticker_symbol, start_str, end_str, max_retries=4):
+    """带指数退避和动态 Cookie 洗净机制的雅虎 K 线数据安全提取器"""
     for attempt in range(max_retries):
-        current_session = get_clean_session()
+        # 每次重试都重新生成带有新鲜 Cookie 的 Session，彻底洗净 429 历史粘滞
+        current_session = get_authenticated_yahoo_session()
         try:
             ticker = yf.Ticker(ticker_symbol, session=current_session)
+            # 采用默认的 history 将自动保持历史一致的后复权价格体系（Adjusted Prices）
             hist = ticker.history(start=start_str, end=end_str)
             if not hist.empty:
                 return hist
-            raise RuntimeError("数据返回为空表。")
+            raise RuntimeError("数据流返回空表。")
         except Exception as e:
-            # 核心修正：显著拉长云端环境下的等待倒计时 (30秒 -> 60秒 -> 120秒)，给机房 IP 刷新留出喘息空间
-            wait_time = (attempt ** 2) * 30 if attempt > 0 else 15
+            # 云端环境下采取深度冷却策略 (45秒 -> 90秒 -> 180秒)
+            wait_time = (attempt ** 2) * 45 if attempt > 0 else 20
             if attempt < max_retries - 1:
-                print(f"提取 {ticker_symbol} 遭遇防火墙拦截。将销毁旧缓存，并在 {wait_time} 秒后切换新指纹执行第 {attempt + 2} 次重试... 原因: {e}")
+                print(f"提取 {ticker_symbol} 被云端拒接。已重置 Session，将在 {wait_time} 秒后重试... 原因: {e}")
                 time.sleep(wait_time)
             else:
-                raise RuntimeError(f"在连续重试 {max_retries} 次后仍无法穿透雅虎财经对 {ticker_symbol} 的拦截。")
+                raise RuntimeError(f"已耗尽所有云端网络穿透策略，仍无法下载 {ticker_symbol}。")
 
 def fetch_raw_data_block(start_str, end_str):
     print(f"正在进行增量交易日抓取: 从 {start_str} 到 {end_str}")
     
-    # 1. 尝试从 Alpha Vantage 提取 JPM
-    df_jpm = fetch_jpm_from_alpha_vantage(start_str, end_str)
+    print("开始提取摩根大通(JPM)后复权日线行情...")
+    jpm_hist = fetch_ticker_from_yahoo_safe("JPM", start_str, end_str)
+    jpm = jpm_hist[['Close']].rename(columns={'Close': 'JPM_Close'})
     
-    # 如果 Alpha Vantage 失败或未配置，降级回滚至 Yahoo Finance 提取
-    if df_jpm.empty:
-        print("执行降级策略：切换至 Yahoo Finance 提取 JPM 行情...")
-        jpm_hist = fetch_ticker_with_hard_retry("JPM", start_str, end_str)
-        jpm = jpm_hist[['Close']].rename(columns={'Close': 'JPM_Close'})
-    else:
-        jpm = df_jpm
-        
-    # 2. 提取大盘恐慌指数 (^VIX)
     print("开始提取大盘恐慌指数(^VIX)行情...")
-    vix_hist = fetch_ticker_with_hard_retry("^VIX", start_str, end_str)
+    vix_hist = fetch_ticker_from_yahoo_safe("^VIX", start_str, end_str)
     vix = vix_hist[['Close']].rename(columns={'Close': 'VIX_Close'})
     
     if isinstance(jpm.columns, pd.MultiIndex): jpm.columns = ['JPM_Close']
     if isinstance(vix.columns, pd.MultiIndex): vix.columns = ['VIX_Close']
     
-    # 剥离时区标签，防止对齐崩溃
+    # --- 核心修正一：强制去时区标签，彻底干掉 Join 冲突 ---
     jpm.index = pd.to_datetime(jpm.index).tz_localize(None).normalize()
     vix.index = pd.to_datetime(vix.index).tz_localize(None).normalize()
     df_market = pd.merge(jpm, vix, left_index=True, right_index=True, how='outer')
     
-    # 3. FRED 官方利率抓取
+    # FRED 利率抓取
     fred_key = os.getenv("FRED_API_KEY")
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DTB3&api_key={fred_key}&file_type=json"
     
@@ -153,15 +122,14 @@ def fetch_raw_data_block(start_str, end_str):
                 records.append({'Date': pd.to_datetime(obs_date), 'Risk_Free_Rate': float(val) / 100.0})
         df_rates = pd.DataFrame(records).set_index('Date')
     except Exception as e:
-        print(f"FRED 利率获取失败，自动切换至 Yahoo Finance 备用利率防封锁更新链: {e}")
-        irx_hist = fetch_ticker_with_hard_retry("^IRX", start_str, end_str)
+        print(f"FRED 利率获取失败，自动切入 Yahoo Finance 备用利率防封锁更新链: {e}")
+        irx_hist = fetch_ticker_from_yahoo_safe("^IRX", start_str, end_str)
         if isinstance(irx_hist.columns, pd.MultiIndex): irx_hist.columns = irx_hist.columns.droplevel(1)
         irx_hist['Risk_Free_Rate'] = irx_hist['Close'] / 100.0
         df_rates = irx_hist[['Risk_Free_Rate']]
         
     df_rates.index = pd.to_datetime(df_rates.index).tz_localize(None).normalize()
     
-    # 横向外连接合并
     df_block = pd.merge(df_market, df_rates, left_index=True, right_index=True, how='outer')
     return df_block.interpolate(method='linear').ffill().bfill()
 

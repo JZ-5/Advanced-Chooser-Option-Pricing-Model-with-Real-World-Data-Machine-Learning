@@ -18,38 +18,6 @@ project_root = current_file.parent.parent
     
 PROCESSED_FILE_PATH = f"{project_root}/data/processed/features_ann_final.csv"
 
-USER_AGENTS = [
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-]
-
-def get_authenticated_yahoo_session():
-    """高级伪装网关：先模拟人类访问雅虎主页获取合规的 Cookie 凭证，突破云端 429 限制"""
-    session = requests.Session()
-    if not os.getenv('GITHUB_ACTIONS'):
-        PROXY_PORT = "7890"
-        session.proxies.update({
-            "http": f"http://127.0.0.1:{PROXY_PORT}",
-            "https": f"http://127.0.0.1:{PROXY_PORT}"
-        })
-    
-    headers = {
-        'User-Agent': random.choice(USER_AGENTS),
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.5',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
-    }
-    session.headers.update(headers)
-    
-    try:
-        # 悄悄访问一次主页，借用雅虎服务器颁发的合法 Cookie 挂件
-        session.get("https://finance.yahoo.com", timeout=10, verify=False)
-    except Exception:
-        pass # 静默失败，允许继续尝试下载
-    return session
-
 def get_pipeline_time_window():
     default_start = "2018-01-01"
     if not os.path.exists(PROCESSED_FILE_PATH):
@@ -65,72 +33,81 @@ def get_pipeline_time_window():
     fetch_start_dt = last_recorded_date - timedelta(days=380)
     return fetch_start_dt.strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"), last_recorded_date
 
-def fetch_ticker_from_yahoo_safe(ticker_symbol, start_str, end_str, max_retries=4):
-    """带指数退避和动态 Cookie 洗净机制的雅虎 K 线数据安全提取器"""
-    for attempt in range(max_retries):
-        # 每次重试都重新生成带有新鲜 Cookie 的 Session，彻底洗净 429 历史粘滞
-        current_session = get_authenticated_yahoo_session()
-        try:
-            ticker = yf.Ticker(ticker_symbol, session=current_session)
-            # 采用默认的 history 将自动保持历史一致的后复权价格体系（Adjusted Prices）
-            hist = ticker.history(start=start_str, end=end_str)
-            if not hist.empty:
-                return hist
-            raise RuntimeError("数据流返回空表。")
-        except Exception as e:
-            # 云端环境下采取深度冷却策略 (45秒 -> 90秒 -> 180秒)
-            wait_time = (attempt ** 2) * 45 if attempt > 0 else 20
-            if attempt < max_retries - 1:
-                print(f"提取 {ticker_symbol} 被云端拒接。已重置 Session，将在 {wait_time} 秒后重试... 原因: {e}")
-                time.sleep(wait_time)
-            else:
-                raise RuntimeError(f"已耗尽所有云端网络穿透策略，仍无法下载 {ticker_symbol}。")
+def fetch_jpm_from_alpha_vantage_paid(start_str, end_str):
+    """商业级数据通道：提取 100% 准确的 JPM 后复权收盘价"""
+    av_key = os.getenv("ALPHA_VANTAGE_KEY")
+    if not av_key:
+        raise ValueError("未在环境变量中检测到 ALPHA_VANTAGE_KEY，请检查配置！")
+        
+    print("正在通过 Alpha Vantage 付费级 TIME_SERIES_DAILY_ADJUSTED 接口增量提取 JPM...")
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY_ADJUSTED&symbol=JPM&apikey={av_key}&outputsize=full"
+    
+    proxies = None if os.getenv('GITHUB_ACTIONS') else {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+    response = requests.get(url, proxies=proxies, timeout=20, verify=False).json()
+    
+    time_series = response.get("Time Series (Daily)", {})
+    if not time_series:
+        raise RuntimeError(f"Alpha Vantage 未返回 JPM 有效时序。API 响应: {list(response.keys())}")
+        
+    records = []
+    for date_str, data in time_series.items():
+        if start_str <= date_str <= end_str:
+            records.append({'Date': pd.to_datetime(date_str), 'JPM_Close': float(data['5. adjusted close'])})
+            
+    if not records:
+        raise RuntimeError("Alpha Vantage 未返回指定区间内的任何有效 JPM 数据。")
+        
+    return pd.DataFrame(records).set_index('Date').sort_index()
+
+def fetch_from_fred(series_id, start_str, end_str, column_name):
+    """通用 FRED 官方 API 提取器：100% 免疫任何机房风控与封锁"""
+    fred_key = os.getenv("FRED_API_KEY")
+    if not fred_key:
+        raise ValueError("未在环境变量中检测到 FRED_API_KEY！")
+        
+    url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={fred_key}&file_type=json"
+    proxies = None if os.getenv('GITHUB_ACTIONS') else {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+    
+    response = requests.get(url, proxies=proxies, timeout=15, verify=False).json()
+    if 'error_message' in response:
+        raise ValueError(f"FRED API 拒绝请求 ({series_id})，原因: {response['error_message']}")
+        
+    observations = response.get('observations', [])
+    records = []
+    for obs in observations:
+        obs_date = obs['date']
+        val = obs['value']
+        if start_str <= obs_date <= end_str and val != '.':
+            records.append({'Date': pd.to_datetime(obs_date), column_name: float(val)})
+            
+    if not records:
+        raise ValueError(f"FRED 未返回 {series_id} 在指定时间区间内的有效观测。")
+        
+    return pd.DataFrame(records).set_index('Date').sort_index()
 
 def fetch_raw_data_block(start_str, end_str):
     print(f"正在进行增量交易日抓取: 从 {start_str} 到 {end_str}")
     
-    print("开始提取摩根大通(JPM)后复权日线行情...")
-    jpm_hist = fetch_ticker_from_yahoo_safe("JPM", start_str, end_str)
-    jpm = jpm_hist[['Close']].rename(columns={'Close': 'JPM_Close'})
+    # 1. 商业通道提取 JPM
+    jpm = fetch_jpm_from_alpha_vantage_paid(start_str, end_str)
     
-    print("开始提取大盘恐慌指数(^VIX)行情...")
-    vix_hist = fetch_ticker_from_yahoo_safe("^VIX", start_str, end_str)
-    vix = vix_hist[['Close']].rename(columns={'Close': 'VIX_Close'})
+    # 2. 官方通道提取大盘恐慌指数 VIX (Series ID: VIXCLS)
+    print("开始从 FRED 官方接口提取大盘恐慌指数(VIX)行情...")
+    vix = fetch_from_fred("VIXCLS", start_str, end_str, "VIX_Close")
     
-    if isinstance(jpm.columns, pd.MultiIndex): jpm.columns = ['JPM_Close']
-    if isinstance(vix.columns, pd.MultiIndex): vix.columns = ['VIX_Close']
+    # 3. 官方通道提取国债无风险利率 (Series ID: DTB3)
+    print("开始从 FRED 官方接口提取 3-Month Treasury Bill 基准利率...")
+    rates = fetch_from_fred("DTB3", start_str, end_str, "Risk_Free_Rate")
     
-    # --- 核心修正一：强制去时区标签，彻底干掉 Join 冲突 ---
+    # 强行剥离潜在的时区标签，确保时间轴完美对齐
     jpm.index = pd.to_datetime(jpm.index).tz_localize(None).normalize()
     vix.index = pd.to_datetime(vix.index).tz_localize(None).normalize()
+    rates.index = pd.to_datetime(rates.index).tz_localize(None).normalize()
+    
+    # 横向干净合并
     df_market = pd.merge(jpm, vix, left_index=True, right_index=True, how='outer')
+    df_block = pd.merge(df_market, rates, left_index=True, right_index=True, how='outer')
     
-    # FRED 利率抓取
-    fred_key = os.getenv("FRED_API_KEY")
-    url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DTB3&api_key={fred_key}&file_type=json"
-    
-    try:
-        proxies = None if os.getenv('GITHUB_ACTIONS') else {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
-        response = requests.get(url, proxies=proxies, timeout=15, verify=False).json()
-        if 'error_message' in response: raise ValueError(response['error_message'])
-            
-        records = []
-        for obs in response.get('observations', []):
-            obs_date = obs['date']
-            val = obs['value']
-            if start_str <= obs_date <= end_str and val != '.':
-                records.append({'Date': pd.to_datetime(obs_date), 'Risk_Free_Rate': float(val) / 100.0})
-        df_rates = pd.DataFrame(records).set_index('Date')
-    except Exception as e:
-        print(f"FRED 利率获取失败，自动切入 Yahoo Finance 备用利率防封锁更新链: {e}")
-        irx_hist = fetch_ticker_from_yahoo_safe("^IRX", start_str, end_str)
-        if isinstance(irx_hist.columns, pd.MultiIndex): irx_hist.columns = irx_hist.columns.droplevel(1)
-        irx_hist['Risk_Free_Rate'] = irx_hist['Close'] / 100.0
-        df_rates = irx_hist[['Risk_Free_Rate']]
-        
-    df_rates.index = pd.to_datetime(df_rates.index).tz_localize(None).normalize()
-    
-    df_block = pd.merge(df_market, df_rates, left_index=True, right_index=True, how='outer')
     return df_block.interpolate(method='linear').ffill().bfill()
 
 def compute_pipeline_features(df_block):
@@ -160,8 +137,11 @@ def append_new_rows(df_new_features, last_recorded_date):
     if df_incremental.empty:
         print("大表已是最新，本日无须追加新交易日。")
         return
+    print(f"成功捕获到 {len(df_incremental)} 个新交易日的特征数据。准备追加...")
     df_history = pd.read_csv(PROCESSED_FILE_PATH, parse_dates=['Date']).set_index('Date')
-    pd.concat([df_history, df_incremental]).sort_index().to_csv(PROCESSED_FILE_PATH)
+    
+    df_combined = pd.concat([df_history, df_incremental]).sort_index()
+    df_combined.to_csv(PROCESSED_FILE_PATH)
     print(f"追加合并成功。特征矩阵最新终点已成功延伸至: {df_incremental.index.max().strftime('%Y-%m-%d')}")
 
 if __name__ == "__main__":

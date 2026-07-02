@@ -1,13 +1,16 @@
 import os
+import time
+import random
 import requests
 import urllib3
 import pandas as pd
 import numpy as np
 import yfinance as yf
 from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from pathlib import Path
 
-# 关闭 HTTPS 证书警告
+load_dotenv()
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # 1. 路径自适应对齐
 current_file = Path(__file__).resolve()
@@ -15,22 +18,36 @@ project_root = current_file.parent.parent
     
 PROCESSED_FILE_PATH = f"{project_root}/data/processed/features_ann_final.csv"
 
-if os.getenv('GITHUB_ACTIONS'):
-    PROXIES = None
-    print("检测到 GitHub Actions 环境，已自动关闭代理。")
-else:
-    PROXY_PORT = "7890"
-    PROXIES = {
-        "http": f"http://127.0.0.1:{PROXY_PORT}",
-        "https": f"http://127.0.0.1:{PROXY_PORT}"
-    }
-    print(f"本地开发环境，已启用代理端口: {PROXY_PORT}")
+# 动态反爬虫浏览器指纹池
+USER_AGENTS = [
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15'
+]
+
+def get_clean_session():
+    """建立完全独立的、无历史粘滞痕迹的全新网络会话，洗净被污染的Cookie"""
+    session = requests.Session()
+    if not os.getenv('GITHUB_ACTIONS'):
+        PROXY_PORT = "7890"
+        session.proxies.update({
+            "http": f"http://127.0.0.1:{PROXY_PORT}",
+            "https": f"http://127.0.0.1:{PROXY_PORT}"
+        })
+    
+    session.headers.update({
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1'
+    })
+    return session
 
 def get_pipeline_time_window():
     default_start = "2018-01-01"
-    
     if not os.path.exists(PROCESSED_FILE_PATH):
-        print(f"未检测到历史特征文件，将从初始起点 {default_start} 开始全量构建。")
         return default_start, datetime.now().strftime("%Y-%m-%d"), None
         
     df_history = pd.read_csv(PROCESSED_FILE_PATH, parse_dates=['Date']).set_index('Date')
@@ -40,43 +57,52 @@ def get_pipeline_time_window():
     last_recorded_date = df_history.index.max()
     print(f"当前数据集最新记录日期为: {last_recorded_date.strftime('%Y-%m-%d')}")
     
-    # 向前回溯 380 个自然日，确保包含 252 个完整的交易工作日以供特征滚动计算
     fetch_start_dt = last_recorded_date - timedelta(days=380)
-    
-    fetch_start_str = fetch_start_dt.strftime("%Y-%m-%d")
-    fetch_end_str = datetime.now().strftime("%Y-%m-%d")
-    
-    return fetch_start_str, fetch_end_str, last_recorded_date
+    return fetch_start_dt.strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"), last_recorded_date
+
+def fetch_ticker_with_hard_retry(ticker_symbol, start_str, end_str, max_retries=4):
+    """稳健数据抓取核心：抗击429频控拦截"""
+    for attempt in range(max_retries):
+        current_session = get_clean_session()
+        try:
+            ticker = yf.Ticker(ticker_symbol, session=current_session)
+            hist = ticker.history(start=start_str, end=end_str)
+            if not hist.empty:
+                return hist
+            raise RuntimeError("数据返回为空表，触发隐式防火墙拦截。")
+        except Exception as e:
+            wait_time = (attempt ** 2) * 10 if attempt > 0 else 5
+            if attempt < max_retries - 1:
+                print(f"提取 {ticker_symbol} 遭遇防火墙拦截。将销毁旧缓存，并在 {wait_time} 秒后切换新指纹执行第 {attempt + 2} 次重试... 原因: {e}")
+                time.sleep(wait_time)
+            else:
+                raise RuntimeError(f"在连续重试 {max_retries} 次后仍无法穿透雅虎财经频控拦截。")
 
 def fetch_raw_data_block(start_str, end_str):
     print(f"正在进行增量交易日抓取: 从 {start_str} 到 {end_str}")
     
-    session = requests.Session()
-    if PROXIES:
-        session.proxies.update(PROXIES)
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    })
+    print("开始提取摩根大通(JPM)日线行情...")
+    jpm_hist = fetch_ticker_with_hard_retry("JPM", start_str, end_str)
+    jpm = jpm_hist[['Close']].rename(columns={'Close': 'JPM_Close'})
     
-    # yfinance 默认只下载周一至周五的交易日数据，排除了周末
-    jpm = yf.download("JPM", start=start_str, end=end_str, session=session, progress=False)[['Close']].rename(columns={'Close': 'JPM_Close'})
-    vix = yf.download("^VIX", start=start_str, end=end_str, session=session, progress=False)[['Close']].rename(columns={'Close': 'VIX_Close'})
+    print("开始提取大盘恐慌指数(^VIX)行情...")
+    vix_hist = fetch_ticker_with_hard_retry("^VIX", start_str, end_str)
+    vix = vix_hist[['Close']].rename(columns={'Close': 'VIX_Close'})
     
-    if isinstance(jpm.columns, pd.MultiIndex):
-        jpm.columns = jpm.columns.droplevel(1)
-        jpm.columns = ['JPM_Close']
-    if isinstance(vix.columns, pd.MultiIndex):
-        vix.columns = vix.columns.droplevel(1)
-        vix.columns = ['VIX_Close']
+    if isinstance(jpm.columns, pd.MultiIndex): jpm.columns = ['JPM_Close']
+    if isinstance(vix.columns, pd.MultiIndex): vix.columns = ['VIX_Close']
         
     df_market = pd.merge(jpm, vix, left_index=True, right_index=True, how='outer')
     
-    # FRED 利率抓取（工作日发布）
+    # FRED 官方利率抓取
     fred_key = os.getenv("FRED_API_KEY")
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DTB3&api_key={fred_key}&file_type=json"
     
     try:
-        response = requests.get(url, proxies=PROXIES, timeout=120, verify=False).json()
+        proxies = None if os.getenv('GITHUB_ACTIONS') else {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+        response = requests.get(url, proxies=proxies, timeout=15, verify=False).json()
+        if 'error_message' in response: raise ValueError(response['error_message'])
+            
         records = []
         for obs in response.get('observations', []):
             obs_date = obs['date']
@@ -85,86 +111,50 @@ def fetch_raw_data_block(start_str, end_str):
                 records.append({'Date': pd.to_datetime(obs_date), 'Risk_Free_Rate': float(val) / 100.0})
         df_rates = pd.DataFrame(records).set_index('Date')
     except Exception as e:
-        print(f"FRED 获取失败，启动 Yahoo Finance 备用交易日利率抓取: {e}")
-        irx = yf.download("^IRX", start=start_str, end=end_str, session=session, progress=False)[['Close']]
-        if isinstance(irx.columns, pd.MultiIndex):
-            irx.columns = irx.columns.droplevel(1)
-        irx['Risk_Free_Rate'] = irx['Close'] / 100.0
-        df_rates = irx[['Risk_Free_Rate']]
+        print(f"FRED 利率获取失败，自动切换至 Yahoo Finance 备用利率防封锁更新链: {e}")
+        irx_hist = fetch_ticker_with_hard_retry("^IRX", start_str, end_str)
+        if isinstance(irx_hist.columns, pd.MultiIndex): irx_hist.columns = irx_hist.columns.droplevel(1)
+        irx_hist['Risk_Free_Rate'] = irx_hist['Close'] / 100.0
+        df_rates = irx_hist[['Risk_Free_Rate']]
         
-    # --- 数据清洗步骤一：时间轴对齐 (Time Alignment) ---
-    df_market.index = pd.to_datetime(df_market.index).normalize()
-    df_rates.index = pd.to_datetime(df_rates.index).normalize()
+    # --- 核心修正：双向强制时区剥离 (Timezone Stripping) 与时间归一化 ---
+    df_market.index = pd.to_datetime(df_market.index).tz_localize(None).normalize()
+    df_rates.index = pd.to_datetime(df_rates.index).tz_localize(None).normalize()
+    
+    # 此时两个 DataFrame 的索引均为纯净的 tz-naive 类型，横向外连接完美通行
     df_block = pd.merge(df_market, df_rates, left_index=True, right_index=True, how='outer')
-    
-    # --- 数据清洗步骤二：缺失值插值 (Interpolation) ---
-    # 利用线性插值与前后填充，平滑洗净因为股债市场假期错配导致的极少数 NaN 数据坏点
-    df_block = df_block.interpolate(method='linear').ffill().bfill()
-    
-    return df_block
+    return df_block.interpolate(method='linear').ffill().bfill()
 
 def compute_pipeline_features(df_block):
     print("正在计算连续量化特征矩阵...")
-    
-    # --- 数据清洗步骤三：异常值清洗 (IQR Clamping) ---
-    # 同步历史稳定边界，对新注入的无风险利率进行 IQR 盖帽限制，防止外部 API 偶发性脏数据冲击
     q1 = df_block['Risk_Free_Rate'].quantile(0.25)
     q3 = df_block['Risk_Free_Rate'].quantile(0.75)
     iqr = q3 - q1
-    lower_bound = q1 - 1.5 * iqr
-    upper_bound = q3 + 1.5 * iqr
-    df_block['Risk_Free_Rate'] = np.clip(df_block['Risk_Free_Rate'], lower_bound, upper_bound)
+    df_block['Risk_Free_Rate'] = np.clip(df_block['Risk_Free_Rate'], q1 - 1.5*iqr, q3 + 1.5*iqr)
     
-    # 特征计算
     df_block['Daily_Return'] = np.log(df_block['JPM_Close'] / df_block['JPM_Close'].shift(1))
     df_block['Rolling_Vol_20d'] = df_block['Daily_Return'].rolling(window=20).std() * np.sqrt(252)
     df_block['Dividend_Growth_Proxy'] = np.log(df_block['JPM_Close'] / df_block['JPM_Close'].shift(252)).rolling(window=20).mean()
     
     df_block['VIX_Decimal'] = df_block['VIX_Close'] / 100.0
-    vix_delta = df_block['VIX_Decimal'].diff()
-    df_block['VIX_JPM_Corr_20d'] = df_block['Daily_Return'].rolling(window=20).corr(vix_delta)
+    df_block['VIX_JPM_Corr_20d'] = df_block['Daily_Return'].rolling(window=20).corr(df_block['VIX_Decimal'].diff())
     df_block['IR_Momentum_10d'] = df_block['Risk_Free_Rate'].rolling(window=10).mean()
     
     df_block['JPM_SMA20_Disparity'] = (df_block['JPM_Close'] / df_block['JPM_Close'].rolling(window=20).mean()) - 1
     df_block['IV_RV_Spread'] = df_block['VIX_Decimal'] - df_block['Rolling_Vol_20d']
     df_block['Rate_Delta'] = df_block['Risk_Free_Rate'].diff()
     
-    # 剔除滚动初始阶段必然产生的冷启动 NaN 行
-    df_block_clean = df_block.dropna().copy()
-    
-    feature_columns = [
-        'JPM_Close', 'VIX_Decimal', 'Risk_Free_Rate',
-        'Daily_Return', 'Rolling_Vol_20d', 'Dividend_Growth_Proxy',
-        'VIX_JPM_Corr_20d', 'IR_Momentum_10d',
-        'JPM_SMA20_Disparity', 'IV_RV_Spread', 'Rate_Delta'
-    ]
-    return df_block_clean[feature_columns].round(4)
+    return df_block.dropna()[['JPM_Close', 'VIX_Decimal', 'Risk_Free_Rate', 'Daily_Return', 'Rolling_Vol_20d', 'Dividend_Growth_Proxy', 'VIX_JPM_Corr_20d', 'IR_Momentum_10d', 'JPM_SMA20_Disparity', 'IV_RV_Spread', 'Rate_Delta']].round(4)
 
 def append_new_rows(df_new_features, last_recorded_date):
-    if df_new_features.empty:
-        print("未生成有效特征。")
-        return
-        
-    if last_recorded_date is None:
-        print("首次全量初始化保存。")
-        df_new_features.to_csv(PROCESSED_FILE_PATH)
-        return
-        
-    # 过滤出真正大于历史最后记录日期的全新增量交易日
+    if df_new_features.empty or last_recorded_date is None: return
     df_incremental = df_new_features[df_new_features.index > last_recorded_date]
-    
     if df_incremental.empty:
         print("大表已是最新，本日无须追加新交易日。")
         return
-        
-    print(f"成功捕获到 {len(df_incremental)} 个新交易日的特征数据。准备追加...")
-    
     df_history = pd.read_csv(PROCESSED_FILE_PATH, parse_dates=['Date']).set_index('Date')
-    
-    # 拼接增量数据并按时间重排
-    df_combined = pd.concat([df_history, df_incremental]).sort_index()
-    df_combined.to_csv(PROCESSED_FILE_PATH)
-    print(f"追加合并成功。特征矩阵最新终点已延伸至: {df_combined.index.max().strftime('%Y-%m-%d')}")
+    pd.concat([df_history, df_incremental]).sort_index().to_csv(PROCESSED_FILE_PATH)
+    print(f"追加合并成功。特征矩阵最新终点已成功延伸至: {df_incremental.index.max().strftime('%Y-%m-%d')}")
 
 if __name__ == "__main__":
     try:

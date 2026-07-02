@@ -218,4 +218,15 @@ __marimo__/
 .streamlit/secrets.toml
 
 #data
-data/raw/data backup
+data\ backup/
+
+#Project discription
+Quantitative\ Research\ \&\ Trading\ -\ Advanced\ Chooser\ Option\ Pricing\ Model\(1\).pdf
+
+#uncompleted code
+/src/financial_news_data_clean.py
+
+#news data
+/data/raw/news_data.csv
+/data/raw/raw_partner_headlines.csv
+/data/raw/sp500_headlines_2008_2024.csv

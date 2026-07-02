@@ -18,7 +18,6 @@ project_root = current_file.parent.parent
     
 PROCESSED_FILE_PATH = f"{project_root}/data/processed/features_ann_final.csv"
 
-# 动态反爬虫浏览器指纹池
 USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -27,7 +26,6 @@ USER_AGENTS = [
 ]
 
 def get_clean_session():
-    """建立完全独立的、无历史粘滞痕迹的全新网络会话，洗净被污染的Cookie"""
     session = requests.Session()
     if not os.getenv('GITHUB_ACTIONS'):
         PROXY_PORT = "7890"
@@ -60,8 +58,40 @@ def get_pipeline_time_window():
     fetch_start_dt = last_recorded_date - timedelta(days=380)
     return fetch_start_dt.strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"), last_recorded_date
 
+def fetch_jpm_from_alpha_vantage(start_str, end_str):
+    """第一战略储备：利用 Alpha Vantage 官方 API 提取 JPM 股价，100% 免疫机房 IP 封锁"""
+    av_key = os.getenv("ALPHA_VANTAGE_KEY")
+    if not av_key:
+        print("未检测到 ALPHA_VANTAGE_KEY 环境变量，跳过此渠道。")
+        return pd.DataFrame()
+        
+    print("正在通过 Alpha Vantage 官方接口增量提取 JPM 股价...")
+    url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol=JPM&apikey={av_key}&outputsize=full"
+    
+    try:
+        proxies = None if os.getenv('GITHUB_ACTIONS') else {"http": "http://127.0.0.1:7890", "https": "http://127.0.0.1:7890"}
+        res = requests.get(url, proxies=proxies, timeout=15, verify=False).json()
+        
+        time_series = res.get("Time Series (Daily)", {})
+        if not time_series:
+            print(f"Alpha Vantage 未返回有效时序，响应快照: {list(res.keys())}")
+            return pd.DataFrame()
+            
+        records = []
+        for date_str, data in time_series.items():
+            if start_str <= date_str <= end_str:
+                records.append({'Date': pd.to_datetime(date_str), 'JPM_Close': float(data['4. close'])})
+                
+        if records:
+            df_av = pd.DataFrame(records).set_index('Date').sort_index()
+            print(f"成功通过 Alpha Vantage 捕获 JPM 股价样本 {len(df_av)} 行。")
+            return df_av
+    except Exception as e:
+        print(f"Alpha Vantage 提取 JPM 发生异常: {e}")
+    return pd.DataFrame()
+
 def fetch_ticker_with_hard_retry(ticker_symbol, start_str, end_str, max_retries=4):
-    """稳健数据抓取核心：抗击429频控拦截"""
+    """第二通道：雅虎财经抗封锁下载器。显著拉长了云端的退避等待时间"""
     for attempt in range(max_retries):
         current_session = get_clean_session()
         try:
@@ -69,32 +99,44 @@ def fetch_ticker_with_hard_retry(ticker_symbol, start_str, end_str, max_retries=
             hist = ticker.history(start=start_str, end=end_str)
             if not hist.empty:
                 return hist
-            raise RuntimeError("数据返回为空表，触发隐式防火墙拦截。")
+            raise RuntimeError("数据返回为空表。")
         except Exception as e:
-            wait_time = (attempt ** 2) * 10 if attempt > 0 else 5
+            # 核心修正：显著拉长云端环境下的等待倒计时 (30秒 -> 60秒 -> 120秒)，给机房 IP 刷新留出喘息空间
+            wait_time = (attempt ** 2) * 30 if attempt > 0 else 15
             if attempt < max_retries - 1:
                 print(f"提取 {ticker_symbol} 遭遇防火墙拦截。将销毁旧缓存，并在 {wait_time} 秒后切换新指纹执行第 {attempt + 2} 次重试... 原因: {e}")
                 time.sleep(wait_time)
             else:
-                raise RuntimeError(f"在连续重试 {max_retries} 次后仍无法穿透雅虎财经频控拦截。")
+                raise RuntimeError(f"在连续重试 {max_retries} 次后仍无法穿透雅虎财经对 {ticker_symbol} 的拦截。")
 
 def fetch_raw_data_block(start_str, end_str):
     print(f"正在进行增量交易日抓取: 从 {start_str} 到 {end_str}")
     
-    print("开始提取摩根大通(JPM)日线行情...")
-    jpm_hist = fetch_ticker_with_hard_retry("JPM", start_str, end_str)
-    jpm = jpm_hist[['Close']].rename(columns={'Close': 'JPM_Close'})
+    # 1. 尝试从 Alpha Vantage 提取 JPM
+    df_jpm = fetch_jpm_from_alpha_vantage(start_str, end_str)
     
+    # 如果 Alpha Vantage 失败或未配置，降级回滚至 Yahoo Finance 提取
+    if df_jpm.empty:
+        print("执行降级策略：切换至 Yahoo Finance 提取 JPM 行情...")
+        jpm_hist = fetch_ticker_with_hard_retry("JPM", start_str, end_str)
+        jpm = jpm_hist[['Close']].rename(columns={'Close': 'JPM_Close'})
+    else:
+        jpm = df_jpm
+        
+    # 2. 提取大盘恐慌指数 (^VIX)
     print("开始提取大盘恐慌指数(^VIX)行情...")
     vix_hist = fetch_ticker_with_hard_retry("^VIX", start_str, end_str)
     vix = vix_hist[['Close']].rename(columns={'Close': 'VIX_Close'})
     
     if isinstance(jpm.columns, pd.MultiIndex): jpm.columns = ['JPM_Close']
     if isinstance(vix.columns, pd.MultiIndex): vix.columns = ['VIX_Close']
-        
+    
+    # 剥离时区标签，防止对齐崩溃
+    jpm.index = pd.to_datetime(jpm.index).tz_localize(None).normalize()
+    vix.index = pd.to_datetime(vix.index).tz_localize(None).normalize()
     df_market = pd.merge(jpm, vix, left_index=True, right_index=True, how='outer')
     
-    # FRED 官方利率抓取
+    # 3. FRED 官方利率抓取
     fred_key = os.getenv("FRED_API_KEY")
     url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DTB3&api_key={fred_key}&file_type=json"
     
@@ -117,11 +159,9 @@ def fetch_raw_data_block(start_str, end_str):
         irx_hist['Risk_Free_Rate'] = irx_hist['Close'] / 100.0
         df_rates = irx_hist[['Risk_Free_Rate']]
         
-    # --- 核心修正：双向强制时区剥离 (Timezone Stripping) 与时间归一化 ---
-    df_market.index = pd.to_datetime(df_market.index).tz_localize(None).normalize()
     df_rates.index = pd.to_datetime(df_rates.index).tz_localize(None).normalize()
     
-    # 此时两个 DataFrame 的索引均为纯净的 tz-naive 类型，横向外连接完美通行
+    # 横向外连接合并
     df_block = pd.merge(df_market, df_rates, left_index=True, right_index=True, how='outer')
     return df_block.interpolate(method='linear').ffill().bfill()
 

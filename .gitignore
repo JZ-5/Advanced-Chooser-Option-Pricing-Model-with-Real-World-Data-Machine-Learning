@@ -230,3 +230,6 @@ Quantitative\ Research\ \&\ Trading\ -\ Advanced\ Chooser\ Option\ Pricing\ Mode
 /data/raw/news_data.csv
 /data/raw/raw_partner_headlines.csv
 /data/raw/sp500_headlines_2008_2024.csv
+
+#anaconda environment
+anaconda_projects/

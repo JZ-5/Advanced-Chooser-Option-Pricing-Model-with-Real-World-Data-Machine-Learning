@@ -1,0 +1,11 @@
+{
+  "project_stage": "Week 3 - Original BSM Model Replication",
+  "fixed_parameters": {
+    "strike_price": 150.0,
+    "final_expiration_t2": 1.0
+  },
+  "sensitivity_analysis_settings": {
+    "choice_dates_t1_array": [0.25, 0.50, 0.75],
+    "comment": "多尺度决策日扫描，用于量化选择权的时间凸性价值"
+  }
+}

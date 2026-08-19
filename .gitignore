@@ -231,5 +231,8 @@ Quantitative\ Research\ \&\ Trading\ -\ Advanced\ Chooser\ Option\ Pricing\ Mode
 /data/raw/raw_partner_headlines.csv
 /data/raw/sp500_headlines_2008_2024.csv
 
+##useless data
+/models/scaler
+/models/gbdt_residual_champion.json
 #anaconda environment
 anaconda_projects/

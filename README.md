@@ -59,17 +59,28 @@ chooser-option-pricing/
 ├── app.py                         # Streamlit 交互式 UI 主程序
 ├── requirements.txt               # 生产环境依赖包列表
 ├── README.md                      # 项目部署与架构说明文档
+├── .github/
+│   ├── workflows/
+│   │   └── data_pipeline.yml      # gitaction流水线文件
+├── config/
+│   └── parameters.json            # BSM 参数
 ├── models/
-│   └── gbdt_residual_champion.pkl # TS-CV 调优后的 3 尺度 Champion 模型权重
+│   └── gbdt_residual_champion.pkl # 调优后的模型权重
 ├── src/
 │   ├── models/
 │   │   └── bsm_chooser.py         # Rubinstein Chooser Option 解析解向量化定价器
-│   ├── pipeline_app.py            # 日频真实数据抓取与 12 维特征工程自动化管线
-│   └── analysis/
-│       └── stress_testing.py      # 极端波动率与利率冲击测试脚本
-├── reports/
-│   ├── final_quant_whitepaper.md  # 终极量化研究白皮书
-│   └── week7_final_delivery.md    # 阶段交付文档
+│   ├── pipeline_app.py            # 交互式 UI 主程序的日频真实数据抓取与 12 维特征工程自动化管线（不储存数据）
+│   ├── pipeline_daily.py          # 真实数据抓取与 12 维特征工程自动化管线（储存数据）
+│   └── pipeline_prediction.py     # 最新交易日推理流水线
+├── notebooks/                     # 各周任务测试代码
+│   ├── week3_bsm_replication.ipynb  
+│   ├── week4_CME_fetch_and_performance_evaluation.ipynb  
+│   ├── week5_feature_preparation_and_ML.ipynb  
+│   ├── week6_optuna.ipynb  
+│   └── week7_stress_testing.ipynb  
+├── doc/                           
+│   ├── performance_benchmark_documentation.md          # BSM 基准模型性能说明文档
+│   └── week5_ml_architecture_design.md                 # Week 5 机器学习架构设计与评估文档
 └── data/                          # 结构化数据存储目录
 ```
 
@@ -108,12 +119,6 @@ ALPHA_VANTAGE_KEY=your_alpha_vantage_api_key
 
 ```bash
 streamlit run app.py
-```
-
-4. 运行模型压力测试
-
-```bash
-python src/analysis/stress_testing.py
 ```
 
 ---

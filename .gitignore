@@ -224,7 +224,7 @@ data\ backup/
 Quantitative\ Research\ \&\ Trading\ -\ Advanced\ Chooser\ Option\ Pricing\ Model\(1\).pdf
 
 #uncompleted code
-/src/financial_news_data_clean.py
+/src/feature_engineering.py
 
 #news data
 /data/raw/news_data.csv

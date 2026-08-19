@@ -34,7 +34,7 @@ def get_pipeline_time_window():
     return fetch_start_dt.strftime("%Y-%m-%d"), datetime.now().strftime("%Y-%m-%d"), last_recorded_date
 
 def fetch_jpm_from_alpha_vantage_paid(start_str, end_str):
-    """商业级数据通道：提取 100% 准确的 JPM 股价及每日派息数据 (7. dividend amount)"""
+    """数据通道：提取JPM 股价及每日派息数据 (7. dividend amount)"""
     av_key = os.getenv("ALPHA_VANTAGE_KEY")
     if not av_key:
         raise ValueError("未在环境变量中检测到 ALPHA_VANTAGE_KEY，请检查配置！")
